@@ -7,9 +7,9 @@
 #define ENABLE_CONVERSATION_MEMORY 1
 
 // Define I2S pins for audio output (speaker)
-#define I2S_DOUT 9
-#define I2S_BCLK 8
-#define I2S_LRC 7
+#define I2S_DOUT 47
+#define I2S_BCLK 48
+#define I2S_LRC 45
 
 // Define INMP441 microphone input pins
 // INMP441 wiring:
@@ -24,10 +24,15 @@
 #define I2S_MIC_SERIAL_DATA 6     // SD - serial data
 
 // Define boot button pin (GPIO0 is the boot button on most ESP32 boards)
-#define BOOT_BUTTON_PIN 0
+//#define BOOT_BUTTON_PIN 0
 
 // Sample rate for recording
 #define SAMPLE_RATE 16000
+
+
+int GreenPin = 17;
+int YellowPin = 16;
+int RedPin = 15;
 
 // WiFi settings
 const char* ssid     = "Tai";
@@ -62,8 +67,15 @@ const char* systemPrompt = "You are Ben, a witty, warm chat companion. "
 "- Add light games/analogies/micro-challenges for fun. "
 "Compression: Keep each reply <=20 words when possible.";
 
+// ===== WAKE PHRASE CONFIGURATION =====
+const char* WAKE_PHRASES[] = {
+  "hey, ben",
+  "hi, ben",
+  "hello, ben",
+  "ben"
+};
 
-
+const int NUM_WAKE_PHRASES = sizeof(WAKE_PHRASES) / sizeof(WAKE_PHRASES[0]);
 
 
 // Global audio variable for TTS playback
@@ -85,28 +97,25 @@ enum ConversationState {
 // State variables
 ConversationState currentState = STATE_IDLE;
 bool continuousMode = false;
-bool buttonPressed = false;
-bool wasButtonPressed = false;
+//bool buttonPressed = false;
+//bool wasButtonPressed = false;
 unsigned long ttsStartTime = 0;
 unsigned long ttsCheckTime = 0;
-
-// TTS completion callback
-/*
-void audio_eof_speech(const char* info) {
-  Serial.println("\n[TTS] Playback completed");
-  // This callback is called when TTS finishes playing
-}
-*/
 
 void setup() {
   // Initialize serial port
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println("\n\n----- Voice Assistant System (ASR+LLM+TTS) Starting -----");
+  pinMode(GreenPin, OUTPUT);
+  pinMode(YellowPin, OUTPUT);
+  pinMode(RedPin, OUTPUT);
 
-  // Initialize boot button
-  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+  digitalWrite(GreenPin, LOW);
+  digitalWrite(YellowPin, LOW);
+  digitalWrite(RedPin, HIGH);
+
+  Serial.println("\n\n----- Voice Assistant System (ASR+LLM+TTS) Starting -----");
 
   // Initialize random seed
   randomSeed(analogRead(0) + millis());
@@ -134,7 +143,7 @@ void setup() {
     // Set I2S output pins for TTS playback
     audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
     // Set volume
-    audio.setVolume(21);
+    audio.setVolume(100);
 
     // Set system prompt for GPT
     gptChat.setSystemPrompt(systemPrompt);
@@ -157,7 +166,7 @@ void setup() {
     // Set audio parameters for ASR
     asrChat.setAudioParams(SAMPLE_RATE, 16, 1);
     asrChat.setSilenceDuration(1000);  // 1 second silence detection
-    asrChat.setMaxRecordingSeconds(50);
+    asrChat.setMaxRecordingSeconds(30);
 
     // Set timeout no speech callback - exit continuous mode if timeout without speech
     asrChat.setTimeoutNoSpeechCallback([]() {
@@ -172,31 +181,29 @@ void setup() {
       return;
     }
 
-    Serial.println("\n----- System Ready -----");
-    Serial.println("Press BOOT button to start/stop continuous conversation mode");
-    Serial.println("In continuous mode, ASR will automatically restart after TTS playback");
+    stopContinuousMode();
+
   } else {
     Serial.println("\nFailed to connect to WiFi. Please check network credentials and retry.");
   }
 }
 
+bool containsWakePhrase(const String& text) {
+  String lower = text;
+  lower.toLowerCase();
+
+  for (int i = 0; i < NUM_WAKE_PHRASES; i++) {
+    if (lower.indexOf(WAKE_PHRASES[i]) >= 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void startContinuousMode() {
   continuousMode = true;
   currentState = STATE_LISTENING;
-
-  Serial.println("\n╔════════════════════════════════════════╗");
-  Serial.println("║  Continuous Conversation Mode Started ║");
-  Serial.println("║  Press BOOT again to stop             ║");
-  Serial.println("╚════════════════════════════════════════╝");
-
-  // Start ASR recording
-  if (asrChat.startRecording()) {
-    Serial.println("\n[ASR] Listening... Speak now");
-  } else {
-    Serial.println("\n[ERROR] Failed to start ASR");
-    continuousMode = false;
-    currentState = STATE_IDLE;
-  }
+  asrChat.startRecording();
 }
 
 void stopContinuousMode() {
@@ -206,13 +213,9 @@ void stopContinuousMode() {
   Serial.println("║  Continuous Conversation Mode Stopped ║");
   Serial.println("╚════════════════════════════════════════╝");
 
-  // Stop any ongoing recording
-  if (asrChat.isRecording()) {
-    asrChat.stopRecording();
-  }
-
   currentState = STATE_IDLE;
-  Serial.println("\nPress BOOT button to start continuous conversation mode");
+  asrChat.startRecording();
+  Serial.println("[ASR] Passive listening for wake phrase...");
 }
 
 void handleASRResult() {
@@ -220,13 +223,21 @@ void handleASRResult() {
   asrChat.clearResult();
 
   if (transcribedText.length() == 0) {
-    Serial.println("[WARN] No text recognized");
+    asrChat.startRecording();
+    return;
+  }
 
-    if (continuousMode) {
-      currentState = STATE_LISTENING;
-      asrChat.startRecording();
+  Serial.printf("[ASR] %s\n", transcribedText.c_str());
+
+  // ===== WAKE PHRASE CHECK =====
+  if (!continuousMode) {
+    if (containsWakePhrase(transcribedText)) {
+      Serial.println("[WAKE] Wake phrase detected");
+      audio.openai_speech(OPENAI_API_KEY, tts_model, "How can I help you today", voice, format, speed);
+      startContinuousMode();
     } else {
-      currentState = STATE_IDLE;
+      // Ignore everything else
+      asrChat.startRecording();
     }
     return;
   }
@@ -247,7 +258,9 @@ void handleASRResult() {
       currentState = STATE_LISTENING;
       asrChat.startRecording();
     } else {
+      continuousMode = false;
       currentState = STATE_IDLE;
+      asrChat.startRecording();
     }
     return;
   }
@@ -273,26 +286,12 @@ void loop() {
   // Handle ASR processing
   asrChat.loop();
 
-  // Handle boot button (toggle continuous mode)
-  buttonPressed = (digitalRead(BOOT_BUTTON_PIN) == LOW); // LOW when pressed
-
-  if (buttonPressed && !wasButtonPressed) {
-    wasButtonPressed = true;
-
-    // Toggle continuous conversation mode
-    if (!continuousMode && currentState == STATE_IDLE) {
-      startContinuousMode();
-    } else if (continuousMode) {
-      stopContinuousMode();
-    }
-  } else if (!buttonPressed && wasButtonPressed) {
-    wasButtonPressed = false;
-  }
-
   // State machine for continuous conversation
   switch (currentState) {
     case STATE_IDLE:
-      // Do nothing, waiting for button press
+      if (asrChat.hasNewResult()) {
+        handleASRResult();
+      }
       break;
 
     case STATE_LISTENING:
@@ -313,7 +312,7 @@ void loop() {
     case STATE_WAIT_TTS_COMPLETE:
       // Check if TTS playback has completed
       // We check audio.isRunning() periodically
-      if (millis() - ttsCheckTime > 500) {  // Check every 500ms
+      if (millis() - ttsCheckTime > 100) {  // Check every 100ms
         ttsCheckTime = millis();
 
         if (!audio.isRunning()) {
@@ -322,7 +321,6 @@ void loop() {
 
           if (continuousMode) {
             // Restart ASR for next round
-            //delay(500);  // Small delay before restarting
             currentState = STATE_LISTENING;
 
             if (asrChat.startRecording()) {
@@ -332,7 +330,9 @@ void loop() {
               stopContinuousMode();
             }
           } else {
+            continuousMode = false;
             currentState = STATE_IDLE;
+            asrChat.startRecording();
           }
         } else {
           // Still playing, check for timeout (optional)
@@ -347,7 +347,9 @@ void loop() {
                 stopContinuousMode();
               }
             } else {
+              continuousMode = false;
               currentState = STATE_IDLE;
+              asrChat.startRecording();
             }
           }
         }
@@ -361,7 +363,6 @@ void loop() {
     yield();
   } else {
     // In other states, can have slightly longer delay
-    //delay(10);
     yield();
   }
 }
