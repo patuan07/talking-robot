@@ -30,13 +30,12 @@
 #define SAMPLE_RATE 16000
 
 
-int GreenPin = 17;
-int YellowPin = 16;
-int RedPin = 15;
+const int PIN_B1 = 17; // Connected to Arduino Pin 2
+const int PIN_B0 = 16; // Connected to Arduino Pin 3
 
 // WiFi settings
-const char* ssid     = "Tai";
-const char* password = "Tai12345";
+const char* ssid     = "YOUR-SSID";
+const char* password = "YOUR-PASSWORD";
 
 // ByteDance ASR API configuration
 const char* asr_api_key = "BYTE-DANCE-API-KEY";
@@ -107,13 +106,8 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  pinMode(GreenPin, OUTPUT);
-  pinMode(YellowPin, OUTPUT);
-  pinMode(RedPin, OUTPUT);
-
-  digitalWrite(GreenPin, LOW);
-  digitalWrite(YellowPin, LOW);
-  digitalWrite(RedPin, HIGH);
+  pinMode(PIN_B1, OUTPUT); 
+  pinMode(PIN_B0, OUTPUT);
 
   Serial.println("\n\n----- Voice Assistant System (ASR+LLM+TTS) Starting -----");
 
@@ -248,6 +242,8 @@ void handleASRResult() {
 
   currentState = STATE_PROCESSING_LLM;
   Serial.println("\n[LLM] Sending to ChatGPT...");
+  digitalWrite(PIN_B1, LOW);
+  digitalWrite(PIN_B0, HIGH); //State 01: Thinking
 
   const String response = gptChat.sendMessage(transcribedText);
 
@@ -289,6 +285,8 @@ void loop() {
   // State machine for continuous conversation
   switch (currentState) {
     case STATE_IDLE:
+      digitalWrite(PIN_B1, LOW);
+      digitalWrite(PIN_B0, LOW); //State 00: Sleeping
       if (asrChat.hasNewResult()) {
         handleASRResult();
       }
@@ -296,6 +294,8 @@ void loop() {
 
     case STATE_LISTENING:
       // Check if ASR has detected end of speech (VAD completed)
+      digitalWrite(PIN_B1, HIGH);
+      digitalWrite(PIN_B0, LOW); //State 10: Listening
       if (asrChat.hasNewResult()) {
         handleASRResult();
       }
@@ -303,13 +303,19 @@ void loop() {
 
     case STATE_PROCESSING_LLM:
       // This state is handled in handleASRResult()
+      digitalWrite(PIN_B1, LOW);
+      digitalWrite(PIN_B0, HIGH); //State 01: Thinking
       break;
 
     case STATE_PLAYING_TTS:
       // This state is handled in handleASRResult()
+      digitalWrite(PIN_B1, HIGH);
+      digitalWrite(PIN_B0, HIGH); //State 11: Talking
       break;
 
     case STATE_WAIT_TTS_COMPLETE:
+      digitalWrite(PIN_B1, HIGH);
+      digitalWrite(PIN_B0, HIGH); //State 11: Talking
       // Check if TTS playback has completed
       // We check audio.isRunning() periodically
       if (millis() - ttsCheckTime > 100) {  // Check every 100ms
