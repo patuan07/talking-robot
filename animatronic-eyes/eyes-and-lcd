@@ -1,0 +1,456 @@
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include <LiquidCrystal_I2C.h>
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+#define SERVOMIN 140  // this is the 'minimum' pulse length count (out of 4096)
+#define SERVOMAX 520  // this is the 'maximum' pulse length count (out of 4096)
+
+int box_center_x;
+int box_center_y;
+int prev_center_x = 1;
+
+unsigned long currentBlinkMillis = 0;
+unsigned long previousBlinkMillis = 0;  // will store last time number changed
+const long blinkInterval = random(5000,1200);   // period at which to change number (in milliseconds)
+int blinkNumber = random(1,2);
+
+unsigned long currentSleepMillis = 0;
+unsigned long previousSleepMillis = 0;
+const long sleepInterval = 20000; 
+
+unsigned long loop_number = 0;
+
+// --- State Variables ---
+int confirmedState = 0;     // The state we are currently acting on
+int previousState = -1;     // Used to detect transitions
+int lastReadBits = -1;      // Used for debouncing
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50; // ms
+
+enum States {
+  SLEEPING,   // eyelids are closed, eyes are not moving, assigned to driftoff()
+  THINKING,   // eyelids look like the robot is thinking, assigned to thinking()
+  LISTENING,  // eyes are open and looking at person, assigned to awake()
+  TALKING,    // eyes are similar to listening, assigned to talking()
+};
+
+States State;
+
+// our servo # counter
+uint8_t servonum = 0;
+
+int xval;
+int yval;
+int trimval;
+int current_xval;
+int prev_xval = 512;
+
+int lexpulse;
+int rexpulse;
+
+int leypulse;
+int reypulse;
+
+int uplidpulse;
+int lolidpulse;
+int altuplidpulse;
+int altlolidpulse;
+
+int sensorValue = 0;
+int outputValue = 0;
+int switchval = 0;
+int loopNumber = 0;
+
+unsigned long awakeTime = 30000;
+
+const int PIN_B1 = 2; // Connect to ESP32 Pin 17
+const int PIN_B0 = 3; // Connect to ESP32 Pin 16
+
+// Define 4 custom characters
+
+// Char 0 (Start of arc top left)
+byte smile_0[] = {
+  B00000, B00000, B00000, B11111, B10000, B01000, B00100, B00010
+};
+// Char 1
+byte smile_1[] = {
+  B00000, B10000, B01000, B00100, B00010, B00001, B00000, B00000
+};
+// Char 2
+byte smile_2[] = {
+  B00000, B00001, B00010, B00100, B01000, B10000, B00000, B00000
+};
+// Char 3
+byte smile_3[] = {
+  B00000, B00000, B00000, B11111, B00001, B00010, B00100, B01000
+};
+
+void setup() {
+
+  // You need to make sure you call Wire.begin() in setup, or the I2C access
+  // below will fail.
+  Wire.begin();
+  pinMode(PIN_B1, INPUT);
+  pinMode(PIN_B0, INPUT);
+  Serial.begin(9600);
+  lcd.init();
+  lcd.backlight();
+  lcd.createChar(0, smile_0);
+  lcd.createChar(1, smile_1);
+  lcd.createChar(2, smile_2);
+  lcd.createChar(3, smile_3);
+  pwm.begin();
+  pwm.setPWMFreq(60);  // Analog servos run at ~60 Hz updates
+  State = SLEEPING;
+  
+  trimval = 550;   // this sets how wide the eyelids are positioned (higher number = wider eyes)
+  trimval = map(trimval, 320, 580, -40, 40);
+  uplidpulse = map(yval, 0, 1023, 400, 280);
+  uplidpulse -= (trimval - 40);
+  uplidpulse = constrain(uplidpulse, 280, 400);
+  altuplidpulse = 680 - uplidpulse;
+
+  lolidpulse = map(yval, 0, 1023, 410, 280);
+  lolidpulse += (trimval / 2);
+  lolidpulse = constrain(lolidpulse, 280, 400);
+  altlolidpulse = 680 - lolidpulse;
+  
+  // Power up sequence to test eyes
+  closeEyes();   
+  delay(3000);
+  wakeup();
+  delay(1000);
+  driftoff();
+  delay(1000);
+
+  Serial.println("setup complete");
+  
+}
+
+void loop() {
+  // 1. READ AND DEBOUNCE PINS
+  int bit1 = digitalRead(PIN_B1); 
+  int bit0 = digitalRead(PIN_B0);
+  int currentRead = (bit1 * 2) + bit0;
+
+  if (currentRead != lastReadBits) {
+    lastDebounceTime = millis();
+    lastReadBits = currentRead;
+  }
+
+  // Only proceed if the signal from ESP32 is stable
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    
+    // 2. CHECK FOR STATE TRANSITIONS (Runs once when state changes)
+    if (currentRead != confirmedState) {
+      previousState = confirmedState;
+      confirmedState = currentRead;
+      
+      handleStateEntry(confirmedState, previousState);
+    }
+    
+    // 3. CONTINUOUS BEHAVIOR (Runs every loop for the current state)
+    handleStateMaintenance(confirmedState);
+  }
+}
+
+// --- TRANSITION LOGIC (The "One-Timers") ---
+void handleStateEntry(int state, int prevState) {
+  // We clear the LCD here so it only happens once per transition
+  lcd.clear();
+
+  switch (state) {
+    case 0: // SLEEPING
+      driftoff(); 
+      break;
+
+    case 1: // THINKING
+      thinkingEntry(); 
+      break;
+
+    case 2: // LISTENING
+      if (prevState == 0) {
+        wakeup();
+      }
+      awakeEntry(); 
+      
+      break;
+
+    case 3: // TALKING
+      talkingEntry();
+      break;
+  }
+}
+
+// --- MAINTENANCE LOGIC (The "Loopers") ---
+void handleStateMaintenance(int state) {
+  switch (state) {
+    case 0:
+      sleeping(); // Handles the "z... zz... zzz"
+      break;
+    case 1:
+      // If you had a loading bar for thinking, it goes here
+      break;
+    case 2:
+      awake();    // Handles your servo calculations and blink timer
+      break;
+    case 3:
+      talking();  // Handles mouth/eye movement while speaking
+      break;
+  }
+}
+
+void blink() {   // script to execute one blink
+  
+  trimval = 550;   // this sets how wide the eyelids are positioned (higher number = wider eyes)
+  trimval = map(trimval, 320, 580, -40, 40);
+  uplidpulse = map(yval, 0, 1023, 400, 280);
+  uplidpulse -= (trimval - 40);
+  uplidpulse = constrain(uplidpulse, 280, 400);
+  altuplidpulse = 680 - uplidpulse;
+
+  lolidpulse = map(yval, 0, 1023, 410, 280);
+  lolidpulse += (trimval / 2);
+  lolidpulse = constrain(lolidpulse, 280, 400);
+  altlolidpulse = 680 - lolidpulse;
+  
+  // closes eyelids
+  pwm.setPWM(2, 0, 500);
+  pwm.setPWM(3, 0, 240);
+  pwm.setPWM(4, 0, 240);
+  pwm.setPWM(5, 0, 500);
+
+  delay(80);
+
+  // opens eyelids to trimval value  
+  pwm.setPWM(2, 0, uplidpulse);
+  pwm.setPWM(3, 0, lolidpulse);
+  pwm.setPWM(4, 0, altuplidpulse);
+  pwm.setPWM(5, 0, altlolidpulse);
+}
+
+void awake() {
+    
+  Serial.println("AWAKE");
+    int xval = 512;
+    int yval = 512;
+    
+    lexpulse = map(xval, 0, 1023, 220, 440);
+    rexpulse = lexpulse;
+    leypulse = map(yval, 0, 1023, 250, 500);
+    reypulse = map(yval, 0, 1023, 400, 280);
+
+    trimval = 550;   // this sets how wide the eyelids are positioned (higher number = wider eyes)
+    trimval = map(trimval, 320, 580, -40, 40);
+    uplidpulse = map(yval, 0, 1023, 400, 280);
+    uplidpulse -= (trimval - 40);
+    uplidpulse = constrain(uplidpulse, 280, 400);
+    altuplidpulse = 680 - uplidpulse;
+
+    lolidpulse = map(yval, 0, 1023, 410, 280);
+    lolidpulse += (trimval / 2);
+    lolidpulse = constrain(lolidpulse, 280, 400);
+    altlolidpulse = 680 - lolidpulse;
+    pwm.setPWM(0, 0, lexpulse);
+    pwm.setPWM(1, 0, leypulse);
+
+    /*  PERIODIC BLINKING  */
+    unsigned long currentBlinkMillis = millis(); // store the current time
+    if (currentBlinkMillis - previousBlinkMillis >= blinkInterval) { // check if interval has passed
+      previousBlinkMillis = currentBlinkMillis;   // save the last time we changed number
+      blink();
+    }
+}
+
+void sleeping() {
+  static unsigned long lastZUpdate = 0;
+  static int zCount = 1;
+  if (millis() - lastZUpdate >= 1000) {
+    lastZUpdate = millis();
+    lcd.setCursor(13, 0); 
+    if (zCount == 1) { lcd.print("z  "); zCount = 2; } 
+    else if (zCount == 2) { lcd.print("zz "); zCount = 3; } 
+    else { lcd.print("zzz"); zCount = 1; }
+  }
+}
+
+void wakeup() {   //  Creature wakes up from sleep (blinks and looks around)
+  
+    Serial.println("WAKEUP");  
+    xval = 500;   // translate sensor information into servo info
+    yval = 500;
+    
+    lexpulse = map(xval, 0, 1023, 220, 440);
+    rexpulse = lexpulse;
+    leypulse = map(yval, 0, 1023, 250, 500);
+    reypulse = map(yval, 0, 1023, 400, 280);
+
+    trimval = 650;   // this sets how wide the eyelids are positioned (higher number = wider eyes)
+    trimval = map(trimval, 320, 580, -40, 40);
+    uplidpulse = map(yval, 0, 1023, 400, 280);
+    uplidpulse -= (trimval - 40);
+    uplidpulse = constrain(uplidpulse, 280, 400);
+    altuplidpulse = 680 - uplidpulse;
+
+    lolidpulse = map(yval, 0, 1023, 410, 280);
+    lolidpulse += (trimval / 2);
+    lolidpulse = constrain(lolidpulse, 280, 400);
+    altlolidpulse = 680 - lolidpulse;
+    pwm.setPWM(0, 0, lexpulse);
+    pwm.setPWM(1, 0, leypulse);
+
+  pwm.setPWM(2, 0, uplidpulse);  //  opens eyelids
+  pwm.setPWM(3, 0, lolidpulse);
+  pwm.setPWM(4, 0, altuplidpulse);
+  pwm.setPWM(5, 0, altlolidpulse);
+
+  delay(100);
+
+  blink();
+  delay(500);
+  blink();
+  delay(500);
+
+  pwm.setPWM(0, 0, 450); // eyes glance right
+  delay(800);
+  pwm.setPWM(0, 0, 220); // eyes glance left
+  delay(1000);
+  pwm.setPWM(0, 0, 330); // eyes look forward
+  delay(1000);
+
+  blink();
+  delay(200);
+  blink();
+}
+
+void driftoff() {   
+//  Slowly closes  eyes + eyeballs roll up
+  
+  pwm.setPWM(0, 0, 330);  // centeres eyes on x-axis
+  blink();
+  blink();
+  for (int i = 1; i <= 30; i++) { // closes eyes slowly
+    const double a = i / 50.0;
+    pwm.setPWM(2, 0, uplidpulse + (400-uplidpulse) * (a)); 
+    pwm.setPWM(3, 0, lolidpulse + (240-lolidpulse) * (a));
+    pwm.setPWM(4, 0, altuplidpulse + (240-altuplidpulse) * (a));
+    pwm.setPWM(5, 0, altlolidpulse + (400-altlolidpulse) * (a));
+    pwm.setPWM(1, 0, 400 + (i)); // eyes roll up
+    delay(40);
+  }
+  pwm.setPWM(2, 0, 460); // closes eyelids completely
+  pwm.setPWM(3, 0, 240);
+  pwm.setPWM(4, 0, 240);
+  pwm.setPWM(5, 0, 460);
+  delay(1000);
+}
+
+void closeEyes() {
+  Serial.println("closeEyes start");
+    xval = 500;   // translate sensor information into servo info
+    yval = 500;
+    
+    lexpulse = map(xval, 0, 1023, 220, 440);
+    rexpulse = lexpulse;
+    leypulse = map(yval, 0, 1023, 250, 500);
+    reypulse = map(yval, 0, 1023, 400, 280);
+
+    trimval = 650;   // this sets how wide the eyelids are positioned (higher number = wider eyes)
+    trimval = map(trimval, 320, 580, -40, 40);
+    uplidpulse = map(yval, 0, 1023, 400, 280);
+    uplidpulse -= (trimval - 40);
+    uplidpulse = constrain(uplidpulse, 280, 400);
+    altuplidpulse = 680 - uplidpulse;
+
+    lolidpulse = map(yval, 0, 1023, 410, 280);
+    lolidpulse += (trimval / 2);
+    lolidpulse = constrain(lolidpulse, 280, 400);
+    altlolidpulse = 680 - lolidpulse;
+    pwm.setPWM(0, 0, lexpulse);
+    pwm.setPWM(1, 0, leypulse);
+    pwm.setPWM(2, 0, 460);
+    pwm.setPWM(3, 0, 240);
+    pwm.setPWM(4, 0, 240);
+    pwm.setPWM(5, 0, 460);  
+
+
+   delay(100);
+     Serial.println("closeEyes finish");
+}
+
+void thinkingEntry(){ lcd.print("Thinking..."); }
+
+void awakeEntry()   {
+  // --- Draw the TOP HALF (Row 0) ---
+  lcd.setCursor(0, 0);
+  lcd.write(byte(0));        // Left-side custom character
+  for (int i = 1; i < 15; i++) {
+    lcd.print("-");          // Middle filler
+  }
+  lcd.write(byte(3));        // Right-side custom character
+
+  // --- Draw the BOTTOM HALF (Row 1) ---
+  lcd.setCursor(0, 1); 
+  lcd.print(" ");            // Col 0: Empty space
+  lcd.write(byte(1));        // Col 1: Curve start character
+  for (int i = 2; i < 14; i++) {
+    lcd.print("_");          // Col 2 to 13: Middle filler
+  }
+  lcd.write(byte(2));        // Col 14: Curve end character
+  lcd.print(" ");            // Col 15: Empty space
+}
+
+void talkingEntry() {lcd.clear();}
+
+void talking() {
+  static unsigned long lastMouthUpdate = 0;
+  static bool mouthOpen = false;
+  const int toggleInterval = 400; // Slightly faster for speech
+
+  if (millis() - lastMouthUpdate >= toggleInterval) {
+    lastMouthUpdate = millis();
+    mouthOpen = !mouthOpen;
+
+    if (mouthOpen) {
+      // GIANT OPEN MOUTH
+      // Row 0: Top lip high
+      // --- Draw the TOP HALF (Row 0) ---
+      lcd.setCursor(0, 0);
+      lcd.write(byte(0));        // Left-side custom character
+      for (int i = 1; i < 15; i++) {
+        lcd.print("-");          // Middle filler
+      }
+      lcd.write(byte(3));        // Right-side custom character
+
+      // --- Draw the BOTTOM HALF (Row 1) ---
+      lcd.setCursor(0, 1); 
+      lcd.print(" ");            // Col 0: Empty space
+      lcd.write(byte(1));        // Col 1: Curve start character
+      for (int i = 2; i < 14; i++) {
+        lcd.print("_");          // Col 2 to 13: Middle filler
+      }
+      lcd.write(byte(2));        // Col 14: Curve end character
+      lcd.print(" ");            // Col 15: Empty space
+    } else {
+      // CLOSED MOUTH (A single line in the middle)
+      lcd.setCursor(0, 0);
+      lcd.write(byte(0));        // Left-side custom character
+      for (int i = 1; i < 15; i++) {
+        lcd.print("-");          // Middle filler
+      }
+      lcd.write(byte(3));        // Right-side custom character
+
+      // --- Draw the BOTTOM HALF (Row 1) ---
+      lcd.setCursor(0, 1); 
+      lcd.print(" ");            // Col 0: Empty space
+      for (int i = 1; i < 15; i++) {
+        lcd.print("-");          // Col 1 to 14: Middle filler
+      }
+      lcd.print(" ");            // Col 15: Empty space
+    }
+  }
+}
