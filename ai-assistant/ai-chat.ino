@@ -368,7 +368,8 @@ void loop() {
     // During recording, minimize delay to ensure audio data is sent fast enough
     yield();
   } else {
-    // In other states, can have slightly longer delay
+    // In other states, can have slightly longer delay (uncomment to add delay)
+    //delay(10);
     yield();
   }
 }
